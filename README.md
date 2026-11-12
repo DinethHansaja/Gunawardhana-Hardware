@@ -4,12 +4,12 @@ Vercel-compatible Next.js application for inventory, purchasing, POS, and store 
 
 ## Current status
 
-Implemented application workflows include Supabase SSR authentication and Admin employee access, product/category and variant maintenance, product image handling, live catalog and stock lookup, stock opening/adjustment posting, movement history, and POS sale checkout with a printable receipt. Six PostgreSQL migrations define the associated schema, access policies, catalog, image and transaction RPCs. Dashboard reporting, purchasing/receiving, returns, credit settlement, expense management, CSV import, and reprint/history are not implemented yet. No Supabase credentials are configured, and migrations have not been applied or integration-tested against PostgreSQL. The workbook in `reference/` is a schema reference only; its example rows are not imported.
+Implemented application workflows include username/password login, Admin user account management, product/category and variant maintenance, product image handling, live catalog and stock lookup, stock opening/adjustment posting, movement history, and POS checkout with a printable receipt. Seven PostgreSQL migrations define the schema, access policies, catalog, image and transaction RPCs, and username/user-management operations. Dashboard reporting, purchasing/receiving, returns, credit settlement, expense management, CSV import, and receipt history/reprint remain. The latest migration has not been applied or integration-tested against the deployed database. The workbook in `reference/` is a schema reference only; its example rows are not imported.
 
 ## Local development
 
 1. Install Node.js 20.9 or later and npm.
-2. Copy `.env.example` to `.env.local` and fill in the Supabase project URL and publishable key.
+2. Copy `.env.example` to `.env.local` and fill in the Supabase project URL, publishable key, and server-only secret key.
 3. Run `npm install`, then `npm run dev` and open http://localhost:3000.
 
 The application can render the foundation without credentials. Database features require a configured Supabase project and migrations.

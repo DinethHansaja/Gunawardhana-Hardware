@@ -17,7 +17,7 @@ export default async function LoginPage() {
           <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">Sign in to your workspace</h1>
           <p className="mt-2 text-sm text-slate-600">Use the account issued by your store administrator.</p>
         </div>
-        {!configured && <p role="status" className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">Authentication is not connected yet. Set the Supabase URL and publishable key to enable sign-in.</p>}
+        {!configured && <p role="status" className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">Authentication is not connected yet. Configure Supabase to enable sign-in.</p>}
         <LoginForm disabled={!configured} />
         <p className="mt-5 text-center text-xs text-slate-500">Store access is managed by your administrator.</p>
       </div>

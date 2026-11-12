@@ -14,7 +14,7 @@ const nav = [
   { label: "Purchasing", href: "/purchasing", icon: "↘" },
   { label: "Customers", href: "/customers", icon: "♙" },
   { label: "Reports", href: "/reports", icon: "▥" },
-  { label: "Employees", href: "/employees", icon: "♙" },
+  { label: "User Management", href: "/employees", icon: "♙" },
 ];
 
 const stats = [
