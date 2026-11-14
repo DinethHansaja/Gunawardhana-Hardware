@@ -86,7 +86,14 @@ export async function updateEmployeeDetails(formData: FormData): Promise<Employe
       p_phone: parsed.data.phone || null, p_branch_id: parsed.data.branchId, p_reason: parsed.data.reason,
     });
     if (error) {
-      await admin.auth.admin.updateUserById(parsed.data.userId, { email: current.user.email!, email_confirm: true });
+      // Auth and Postgres cannot share a transaction. Restore every Auth field
+      // changed above when the database RPC rejects the profile update.
+      const { error: rollbackError } = await admin.auth.admin.updateUserById(parsed.data.userId, {
+        email: current.user.email!, email_confirm: true, user_metadata: current.user.user_metadata,
+      });
+      if (rollbackError) {
+        return { error: "The database update failed and the Auth rollback also failed. Reconcile this employee account before further changes." };
+      }
       return { error: error.code === "23505" ? "That username or email is already in use." : "The account changes could not be saved." };
     }
   } catch { return { error: "Account editing is unavailable. Check server Supabase configuration." }; }
