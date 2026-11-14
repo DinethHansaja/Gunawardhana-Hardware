@@ -17,6 +17,7 @@ import { updateEmployeeDetails } from "./actions";
 const previousUser = {
   id: "c2e6c03a-851b-48f9-993d-0a0c62082f2c",
   email: "old@example.com",
+  email_confirmed_at: "2026-01-01T00:00:00.000Z",
   user_metadata: { display_name: "Old Name", username: "oldname", custom: "preserve" },
 };
 
@@ -32,29 +33,45 @@ function formData() {
   return form;
 }
 
-describe("updateEmployeeDetails Auth rollback", () => {
+describe("updateEmployeeDetails Auth consistency", () => {
   const updateUserById = vi.fn();
+  const getUserById = vi.fn();
   const rpc = vi.fn();
+  let authUser: typeof previousUser;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    authUser = structuredClone(previousUser);
     mocks.getEmployee.mockResolvedValue({ id: "admin-id", role: "admin" });
-    mocks.createAdminClient.mockReturnValue({
-      auth: { admin: { getUserById: vi.fn().mockResolvedValue({ data: { user: previousUser }, error: null }), updateUserById } },
+    getUserById.mockImplementation(async () => ({ data: { user: structuredClone(authUser) }, error: null }));
+    updateUserById.mockImplementation(async (_id, update) => {
+      authUser = {
+        ...authUser,
+        ...("email" in update ? { email: update.email } : {}),
+        ...("user_metadata" in update ? { user_metadata: update.user_metadata } : {}),
+      };
+      return { data: { user: authUser }, error: null };
     });
+    mocks.createAdminClient.mockReturnValue({ auth: { admin: { getUserById, updateUserById } } });
     mocks.createClient.mockResolvedValue({ rpc });
-    updateUserById.mockResolvedValue({ data: { user: previousUser }, error: null });
-    rpc.mockResolvedValue({ error: { code: "23505" } });
+    rpc.mockResolvedValue({ error: null });
   });
 
-  it("restores the prior email and complete user metadata after an RPC failure", async () => {
+  it("returns success when the database update succeeds", async () => {
     const result = await updateEmployeeDetails(formData());
 
-    expect(updateUserById).toHaveBeenNthCalledWith(1, previousUser.id, expect.objectContaining({
-      email: "new@example.com",
-      user_metadata: { ...previousUser.user_metadata, display_name: "New Name", username: "newname" },
-    }));
-    expect(updateUserById).toHaveBeenNthCalledWith(2, previousUser.id, {
+    expect(result).toEqual({ success: "Account details updated." });
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(updateUserById).toHaveBeenCalledOnce();
+  });
+
+  it("compensates after a returned RPC error", async () => {
+    rpc.mockResolvedValue({ error: { code: "23505" } });
+
+    const result = await updateEmployeeDetails(formData());
+
+    expect(updateUserById).toHaveBeenCalledTimes(2);
+    expect(updateUserById.mock.calls[1][1]).toEqual({
       email: previousUser.email,
       email_confirm: true,
       user_metadata: previousUser.user_metadata,
@@ -62,12 +79,68 @@ describe("updateEmployeeDetails Auth rollback", () => {
     expect(result).toEqual({ error: "That username or email is already in use." });
   });
 
-  it("reports that manual reconciliation is needed when the Auth rollback fails", async () => {
-    updateUserById.mockResolvedValueOnce({ data: { user: previousUser }, error: null })
-      .mockResolvedValueOnce({ data: { user: null }, error: { message: "Auth unavailable" } });
+  it("attempts guarded compensation when the RPC throws", async () => {
+    rpc.mockRejectedValue(new Error("transport detail must not be returned"));
 
     const result = await updateEmployeeDetails(formData());
 
-    expect(result).toEqual({ error: "The database update failed and the Auth rollback also failed. Reconcile this employee account before further changes." });
+    expect(updateUserById).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ error: "The database request outcome is uncertain. Auth compensation was attempted; verify both account records before retrying." });
+  });
+
+  it("returns a reconciliation-required error when rollback fails", async () => {
+    rpc.mockResolvedValue({ error: { code: "XX000", message: "private database detail" } });
+    updateUserById.mockImplementationOnce(async (_id, update) => {
+      authUser = { ...authUser, email: update.email, user_metadata: update.user_metadata };
+      return { data: { user: authUser }, error: null };
+    }).mockResolvedValueOnce({ data: { user: null }, error: { message: "private Auth detail" } });
+
+    const result = await updateEmployeeDetails(formData());
+
+    expect(result?.error).toContain("The database rejected the employee update");
+    expect(result?.error).toContain("Reconciliation is required.");
+    expect(result?.error).not.toContain("private");
+  });
+
+  it("preserves newer unrelated metadata while restoring the fields this action changed", async () => {
+    rpc.mockResolvedValue({ error: { code: "XX000" } });
+    updateUserById.mockImplementationOnce(async (_id, update) => {
+      authUser = {
+        ...authUser,
+        email: update.email,
+        user_metadata: { ...update.user_metadata, concurrent_note: "newer value" },
+      };
+      return { data: { user: authUser }, error: null };
+    });
+
+    await updateEmployeeDetails(formData());
+
+    expect(updateUserById.mock.calls[1][1].user_metadata).toEqual({
+      ...previousUser.user_metadata,
+      concurrent_note: "newer value",
+    });
+  });
+
+  it("does not overwrite concurrently changed fields owned by another update", async () => {
+    rpc.mockResolvedValue({ error: { code: "XX000" } });
+    updateUserById.mockImplementationOnce(async (_id, update) => {
+      authUser = { ...authUser, email: update.email, user_metadata: { ...update.user_metadata, display_name: "Concurrent Name" } };
+      return { data: { user: authUser }, error: null };
+    });
+
+    const result = await updateEmployeeDetails(formData());
+
+    expect(updateUserById).toHaveBeenCalledOnce();
+    expect(result?.error).toContain("Reconciliation is required.");
+    expect(authUser.user_metadata.display_name).toBe("Concurrent Name");
+  });
+
+  it("does not call the database when the Auth update fails before applying", async () => {
+    updateUserById.mockRejectedValueOnce(new Error("transport failure"));
+
+    const result = await updateEmployeeDetails(formData());
+
+    expect(rpc).not.toHaveBeenCalled();
+    expect(result).toEqual({ error: "Could not update the account email. It may already be in use." });
   });
 });
