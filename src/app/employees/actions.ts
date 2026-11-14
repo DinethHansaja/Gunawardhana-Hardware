@@ -18,6 +18,77 @@ function authEmail(username: string, contactEmail: string | null) {
 
 export type EmployeeActionResult = { error?: string; success?: string };
 
+type AuthEmployeeFields = {
+  email: string | null;
+  emailConfirmed: boolean;
+  user_metadata: Record<string, unknown>;
+};
+
+type CompensationResult = "restored" | "unchanged" | "conflict" | "failed";
+
+// Auth and Postgres have no shared transaction. This compare-before-compensate
+// avoids reverting fields that have already changed, though Auth offers no
+// conditional update/CAS to close the race between this read and its write.
+async function compensateAuthEmployeeUpdate(
+  admin: ReturnType<typeof createAdminClient>,
+  userId: string,
+  previous: AuthEmployeeFields,
+  intended: { email: string; displayName: string; username: string },
+): Promise<CompensationResult> {
+  try {
+    const { data, error } = await admin.auth.admin.getUserById(userId);
+    const latest = data.user;
+    if (error || !latest) return "failed";
+
+    const latestMetadata = latest.user_metadata ?? {};
+    const latestEmailConfirmed = Boolean(latest.email_confirmed_at);
+    const fieldsMatch = (field: "display_name" | "username", intendedValue: string, previousValue: unknown) =>
+      latestMetadata[field] === intendedValue || latestMetadata[field] === previousValue;
+    if (latest.email !== intended.email && latest.email !== previous.email) return "conflict";
+    if (latestEmailConfirmed !== true && latestEmailConfirmed !== previous.emailConfirmed) return "conflict";
+    if (!fieldsMatch("display_name", intended.displayName, previous.user_metadata.display_name)
+      || !fieldsMatch("username", intended.username, previous.user_metadata.username)) return "conflict";
+
+    const emailChangedByThisAction = latest.email === intended.email && latest.email !== previous.email;
+    const confirmationChangedByThisAction = latestEmailConfirmed && !previous.emailConfirmed;
+    const displayNameChangedByThisAction = latestMetadata.display_name === intended.displayName
+      && intended.displayName !== previous.user_metadata.display_name;
+    const usernameChangedByThisAction = latestMetadata.username === intended.username
+      && intended.username !== previous.user_metadata.username;
+    if (!emailChangedByThisAction && !confirmationChangedByThisAction
+      && !displayNameChangedByThisAction && !usernameChangedByThisAction) return "unchanged";
+    if (emailChangedByThisAction && previous.email === null) return "failed";
+
+    // Restore only the fields this action owns, using the latest metadata as
+    // the base so unrelated metadata written since our initial read survives.
+    const restoredMetadata = { ...latestMetadata };
+    if (displayNameChangedByThisAction) restoredMetadata.display_name = previous.user_metadata.display_name ?? null;
+    if (usernameChangedByThisAction) restoredMetadata.username = previous.user_metadata.username ?? null;
+    const { error: rollbackError } = await admin.auth.admin.updateUserById(userId, {
+      ...(emailChangedByThisAction ? { email: previous.email as string } : {}),
+      ...(emailChangedByThisAction || confirmationChangedByThisAction
+        ? { email_confirm: previous.emailConfirmed }
+        : {}),
+      ...((displayNameChangedByThisAction || usernameChangedByThisAction)
+        ? { user_metadata: restoredMetadata }
+        : {}),
+    });
+    return rollbackError ? "failed" : "restored";
+  } catch {
+    return "failed";
+  }
+}
+
+function updateFailureMessage(result: CompensationResult, databaseFailure?: "duplicate" | "rejected", authFailure = false) {
+  if (result === "failed" || result === "conflict") {
+    if (authFailure) return "The Auth update may have partially applied and could not be safely restored. Reconciliation is required.";
+    const cause = databaseFailure === "duplicate" ? "The username or email is already in use" : "The database rejected the employee update";
+    return `${cause}, and the Auth account could not be safely restored. Reconciliation is required.`;
+  }
+  if (authFailure) return "Could not update the account email. It may already be in use.";
+  return databaseFailure === "duplicate" ? "That username or email is already in use." : "The account changes could not be saved.";
+}
+
 export async function createEmployee(formData: FormData): Promise<EmployeeActionResult> {
   const actor = await getEmployee();
   if (actor?.role !== "admin") return { error: "Only an administrator can create accounts." };
@@ -69,34 +140,62 @@ export async function updateEmployeeDetails(formData: FormData): Promise<Employe
     branchId: formData.get("branchId"), reason: formData.get("reason"),
   });
   if (!parsed.success) return { error: "Check the edited user details and reason." };
+  let admin: ReturnType<typeof createAdminClient>;
+  let previous: AuthEmployeeFields;
+  let loginEmail: string;
   try {
-    const admin = createAdminClient();
+    admin = createAdminClient();
     const { data: current, error: currentError } = await admin.auth.admin.getUserById(parsed.data.userId);
     if (currentError || !current.user) return { error: "User account was not found." };
-    const loginEmail = authEmail(parsed.data.username, parsed.data.contactEmail);
+    previous = {
+      email: current.user.email,
+      emailConfirmed: Boolean(current.user.email_confirmed_at),
+      user_metadata: current.user.user_metadata ?? {},
+    };
+    loginEmail = authEmail(parsed.data.username, parsed.data.contactEmail);
+  } catch {
+    return { error: "Account editing is unavailable. Check server Supabase configuration." };
+  }
+
+  const intended = { email: loginEmail, displayName: parsed.data.displayName, username: parsed.data.username };
+  try {
     const { error: authError } = await admin.auth.admin.updateUserById(parsed.data.userId, {
-      email: loginEmail, email_confirm: true,
-      user_metadata: { ...current.user.user_metadata, display_name: parsed.data.displayName, username: parsed.data.username },
+      email: intended.email, email_confirm: true,
+      user_metadata: { ...previous.user_metadata, display_name: intended.displayName, username: intended.username },
     });
-    if (authError) return { error: "Could not update the account email. It may already be in use." };
-    const supabase = await createClient();
-    const { error } = await supabase.rpc("set_employee_details", {
-      p_user_id: parsed.data.userId, p_username: parsed.data.username, p_login_email: loginEmail,
-      p_contact_email: parsed.data.contactEmail, p_display_name: parsed.data.displayName,
-      p_phone: parsed.data.phone || null, p_branch_id: parsed.data.branchId, p_reason: parsed.data.reason,
-    });
-    if (error) {
-      // Auth and Postgres cannot share a transaction. Restore every Auth field
-      // changed above when the database RPC rejects the profile update.
-      const { error: rollbackError } = await admin.auth.admin.updateUserById(parsed.data.userId, {
-        email: current.user.email!, email_confirm: true, user_metadata: current.user.user_metadata,
-      });
-      if (rollbackError) {
-        return { error: "The database update failed and the Auth rollback also failed. Reconcile this employee account before further changes." };
-      }
-      return { error: error.code === "23505" ? "That username or email is already in use." : "The account changes could not be saved." };
+    if (authError) {
+      // An error response can still be ambiguous about whether the remote write
+      // reached Auth, so inspect current state before deciding whether to repair.
+      const compensation = await compensateAuthEmployeeUpdate(admin, parsed.data.userId, previous, intended);
+      return { error: updateFailureMessage(compensation, undefined, true) };
     }
-  } catch { return { error: "Account editing is unavailable. Check server Supabase configuration." }; }
+
+    let databaseError: { code?: string } | null = null;
+    try {
+      const supabase = await createClient();
+      const { error } = await supabase.rpc("set_employee_details", {
+        p_user_id: parsed.data.userId, p_username: parsed.data.username, p_login_email: loginEmail,
+        p_contact_email: parsed.data.contactEmail, p_display_name: parsed.data.displayName,
+        p_phone: parsed.data.phone || null, p_branch_id: parsed.data.branchId, p_reason: parsed.data.reason,
+      });
+      databaseError = error;
+    } catch {
+      // Auth and PostgreSQL cannot participate in one transaction. A thrown
+      // RPC may have committed before the connection failed, so even a
+      // successful Auth compensation cannot prove the database rolled back.
+      const compensation = await compensateAuthEmployeeUpdate(admin, parsed.data.userId, previous, intended);
+      return { error: compensation === "restored" || compensation === "unchanged"
+        ? "The database request outcome is uncertain. Auth compensation was attempted; verify both account records before retrying."
+        : updateFailureMessage(compensation) };
+    }
+    if (databaseError) {
+      const compensation = await compensateAuthEmployeeUpdate(admin, parsed.data.userId, previous, intended);
+      return { error: updateFailureMessage(compensation, databaseError.code === "23505" ? "duplicate" : "rejected") };
+    }
+  } catch {
+    const compensation = await compensateAuthEmployeeUpdate(admin, parsed.data.userId, previous, intended);
+    return { error: updateFailureMessage(compensation) };
+  }
   revalidatePath("/employees");
   return { success: "Account details updated." };
 }
